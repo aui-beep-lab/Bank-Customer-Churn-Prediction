@@ -1,0 +1,454 @@
+---
+title: "Final Project Bank Churn (Group 8)"
+author: "Mohammad Arif Ul Islam"
+date: "2025-04-17"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(readxl)
+library(xgboost)
+library(pROC)
+library(openxlsx)
+library(rpart)
+library(corrplot)
+```
+
+## Churn Prediction - CRISP-DM Structure
+
+### 1. Business Understanding
+Goal: Predict customer churn to inform retention strategy.
+
+### 2. Data Understanding
+```{r data-understanding}
+# Set CRAN mirror
+options(repos = "https://cran.rstudio.com/")
+
+# Install required packages (added corrplot)
+install.packages(c("tidyverse", "caret", "randomForest", "readxl", "xgboost", 
+                   "pROC", "openxlsx", "rpart", "corrplot"), dependencies = TRUE)
+
+# Load libraries (already loaded in setup, so no need to repeat here)
+library(caret)
+library(randomForest)
+library(readxl)
+library(xgboost)
+library(pROC)
+library(openxlsx)
+library(rpart)
+
+# Define file path
+file_path <- "C:\\Users\\Administrator\\Downloads\\Bank Customer Churn Prediction.csv"
+
+# Load the CSV file
+raw_data <- read.csv(file_path)
+
+# Explore data
+glimpse(raw_data)
+summary(raw_data)
+```
+
+### 3. Data Preparation
+```{r data-prep}
+# Convert and clean columns
+data <- raw_data %>%
+  mutate(
+    balance = as.numeric(gsub(",", "", balance)),
+    estimated_salary = as.numeric(gsub(",", "", estimated_salary)),
+    Gender = as.factor(gender),
+    Geography = as.factor(country),
+    HasCrCard = as.factor(credit_card),
+    IsActiveMember = as.factor(active_member),
+    Age = as.numeric(age),
+    Tenure = as.numeric(tenure),
+    NumOfProducts = as.numeric(products_number),
+    churn = factor(churn, levels = c(0, 1), labels = c("No", "Yes"))
+  ) %>%
+  select(-customer_id, -gender, -country, -credit_card, -active_member, -age, -tenure, -products_number)
+
+# Handle missing values
+missing_summary <- sapply(data, function(x) sum(is.na(x)))
+print("Missing values per column:")
+print(missing_summary)
+
+for (col in names(data)) {
+  if (any(is.na(data[[col]]))) {
+    if (is.numeric(data[[col]])) {
+      median_val <- median(data[[col]], na.rm = TRUE)
+      data[[col]][is.na(data[[col]])] <- median_val
+    } else if (is.factor(data[[col]])) {
+      mode_val <- names(which.max(table(data[[col]])))
+      data[[col]][is.na(data[[col]])] <- mode_val
+    }
+  }
+}
+
+stopifnot(sum(is.na(data)) == 0)
+
+# Split data
+set.seed(123)
+train_index <- createDataPartition(data$churn, p = 0.7, list = FALSE)
+train_data <- data[train_index, ]
+test_data <- data[-train_index, ]
+```
+
+### 4. Modeling
+```{r modeling}
+# Set up 5-fold cross-validation control
+ctrl <- trainControl(method = "cv", number = 5)
+
+# Random Forest with cross-validation
+model_rf <- train(churn ~ ., data = train_data, method = "rf", trControl = ctrl, tuneLength = 3)
+pred_rf <- predict(model_rf, test_data)
+
+# XGBoost with manual 5-fold cross-validation
+set.seed(123)
+folds <- createFolds(train_data$churn, k = 5, list = TRUE, returnTrain = FALSE)
+xgb_cv_results <- list()
+for (i in 1:5) {
+  test_fold <- folds[[i]]
+  train_fold <- unlist(folds[-i])
+  train_fold_data <- train_data[train_fold, ]
+  test_fold_data <- train_data[test_fold, ]
+  full_matrix <- model.matrix(churn ~ . - 1, data = train_fold_data)
+  y_train <- as.numeric(train_fold_data$churn) - 1
+  model_xgb <- xgboost(data = full_matrix, label = y_train, nrounds = 50, objective = "binary:logistic", verbose = 0)
+  pred_prob <- predict(model_xgb, model.matrix(churn ~ . - 1, data = test_fold_data))
+  pred_xgb_fold <- ifelse(pred_prob > 0.5, "Yes", "No") %>% factor(levels = c("No", "Yes"))
+  xgb_cv_results[[i]] <- confusionMatrix(pred_xgb_fold, test_fold_data$churn)$overall["Accuracy"]
+}
+mean_xgb_acc <- mean(unlist(xgb_cv_results))
+pred_xgb <- predict(xgboost(data = model.matrix(churn ~ . - 1, data = train_data), 
+                            label = as.numeric(train_data$churn) - 1, 
+                            nrounds = 50, objective = "binary:logistic", verbose = 0), 
+                    model.matrix(churn ~ . - 1, data = test_data))
+pred_xgb <- ifelse(pred_xgb > 0.5, "Yes", "No") %>% factor(levels = c("No", "Yes"))
+
+# Decision Tree with cross-validation
+model_tree <- train(churn ~ ., data = train_data, method = "rpart", trControl = ctrl, tuneLength = 3)
+pred_tree <- predict(model_tree, test_data)
+
+# Logistic Regression with cross-validation
+model_log <- train(churn ~ ., data = train_data, method = "glm", family = "binomial", trControl = ctrl)
+pred_prob_log <- predict(model_log, test_data, type = "prob")  # Fix: Use type = "prob" to get probabilities
+pred_log <- ifelse(pred_prob_log[, "Yes"] > 0.5, "Yes", "No") %>% factor(levels = c("No", "Yes"))
+
+# K-Nearest Neighbors with cross-validation
+train_data$churn <- factor(train_data$churn, levels = c("No", "Yes"))
+test_data$churn <- factor(test_data$churn, levels = c("No", "Yes"))
+dummies <- dummyVars(~ ., data = train_data %>% select(-churn))
+train_knn <- predict(dummies, newdata = train_data) %>% as.data.frame()
+test_knn <- predict(dummies, newdata = test_data) %>% as.data.frame()
+model_knn <- train(x = train_knn, y = train_data$churn, method = "knn", trControl = ctrl, tuneLength = 3)
+pred_knn <- predict(model_knn, test_knn)
+```
+
+### 5. Evaluation
+```{r evaluation}
+cat("\n✅ Random Forest:\n")
+cm_rf <- confusionMatrix(pred_rf, test_data$churn)
+print(cm_rf)
+
+cat("\n✅ XGBoost (Mean CV Accuracy):\n")
+cat("Mean 5-fold CV Accuracy:", mean_xgb_acc, "\n")
+cm_xgb <- confusionMatrix(pred_xgb, test_data$churn)
+print(cm_xgb)
+
+cat("\n✅ Decision Tree:\n")
+cm_tree <- confusionMatrix(pred_tree, test_data$churn)
+print(cm_tree)
+
+cat("\n✅ Logistic Regression:\n")
+cm_log <- confusionMatrix(pred_log, test_data$churn)
+print(cm_log)
+
+cat("\n✅ KNN:\n")
+cm_knn <- confusionMatrix(pred_knn, test_data$churn)
+print(cm_knn)
+```
+
+### 6. Feature Importance
+```{r feature-importance-rf}
+# Random Forest
+importance_rf <- as.data.frame(importance(model_rf$finalModel)) %>%
+  rownames_to_column("Feature") %>%
+  arrange(desc(MeanDecreaseGini))
+ggplot(importance_rf, aes(x = reorder(Feature, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "forestgreen") +
+  coord_flip() +
+  labs(title = "Feature Importance - Random Forest", x = "Feature", y = "Importance")
+```
+
+```{r feature-importance-xgb}
+# XGBoost
+importance_xgb <- xgb.importance(model = model_xgb)
+ggplot(importance_xgb, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "goldenrod") +
+  coord_flip() +
+  labs(title = "Feature Importance - XGBoost", x = "Feature", y = "Gain")
+```
+
+```{r feature-importance-tree}
+# Decision Tree
+importance_tree <- as.data.frame(varImp(model_tree$finalModel)) %>% 
+  rownames_to_column("Feature") %>%
+  rename(Importance = Overall) %>%
+  arrange(desc(Importance))
+ggplot(importance_tree, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "deepskyblue3") +
+  coord_flip() +
+  labs(title = "Feature Importance - Decision Tree", x = "Feature", y = "Importance")
+```
+
+```{r feature-importance-log}
+# Logistic Regression
+importance_log <- varImp(model_log)$importance %>%  # Use model_log directly
+  as.data.frame() %>%  # Convert to data frame
+  rownames_to_column("Feature") %>%
+  arrange(desc(Overall))
+ggplot(importance_log, aes(x = reorder(Feature, Overall), y = Overall)) +
+  geom_bar(stat = "identity", fill = "tomato") +
+  coord_flip() +
+  labs(title = "Feature Importance - Logistic Regression", x = "Feature", y = "Importance")
+```
+
+```{r feature-importance-knn}
+# KNN
+importance_knn <- filterVarImp(train_knn, train_data$churn)
+importance_knn <- importance_knn %>%
+  rownames_to_column("Feature") %>%
+  rename(Importance = Yes) %>%
+  arrange(desc(Importance))
+ggplot(importance_knn, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Influence - KNN", x = "Feature", y = "Importance")
+```
+
+### 6. Exploratory Data Analysis
+
+#### Churn Statistics
+```{r churn-statistics}
+# Calculate overall churn statistics
+total_customers <- nrow(data)
+churned_customers <- sum(data$churn == "Yes")
+churn_rate <- (churned_customers / total_customers) * 100
+
+# Display the statistics
+cat("Total customers:", total_customers, "\n")
+cat("Churned customers:", churned_customers, "\n")
+cat("Churn rate:", round(churn_rate, 2), "%\n")
+```
+
+#### Demographic Insights
+```{r demographic-insights}
+# Define age groups
+data$age_group <- cut(data$Age, breaks = c(0, 30, 50, Inf), labels = c("<30", "30-50", ">50"))
+
+# Churn rate by age group
+age_group_churn <- data %>%
+  group_by(age_group) %>%
+  summarise(
+    total_customers = n(),
+    churned_customers = sum(churn == "Yes"),
+    churn_rate = mean(churn == "Yes") * 100
+  )
+print(age_group_churn)
+
+# Plot churn rate by age group
+ggplot(age_group_churn, aes(x = age_group, y = churn_rate)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  labs(title = "Churn Rate by Age Group", x = "Age Group", y = "Churn Rate (%)")
+
+# Churn rate by gender
+gender_churn <- data %>%
+  group_by(Gender) %>%
+  summarise(
+    total_customers = n(),
+    churned_customers = sum(churn == "Yes"),
+    churn_rate = mean(churn == "Yes") * 100
+  )
+print(gender_churn)
+
+# Plot churn rate by gender
+ggplot(gender_churn, aes(x = Gender, y = churn_rate)) +
+  geom_bar(stat = "identity", fill = "pink") +
+  labs(title = "Churn Rate by Gender", x = "Gender", y = "Churn Rate (%)")
+```
+
+#### Geographical Insights
+```{r geographical-insights}
+# Churn rate by geography
+geography_churn <- data %>%
+  group_by(Geography) %>%
+  summarise(
+    total_customers = n(),
+    churned_customers = sum(churn == "Yes"),
+    churn_rate = mean(churn == "Yes") * 100
+  )
+print(geography_churn)
+
+# Plot churn rate by geography
+ggplot(geography_churn, aes(x = Geography, y = churn_rate)) +
+  geom_bar(stat = "identity", fill = "green") +
+  labs(title = "Churn Rate by Geography", x = "Country", y = "Churn Rate (%)")
+```
+
+#### Product Usage Impact
+```{r product-usage-impact}
+# Churn rate by number of products
+products_churn <- data %>%
+  group_by(NumOfProducts) %>%
+  summarise(
+    total_customers = n(),
+    churned_customers = sum(churn == "Yes"),
+    churn_rate = mean(churn == "Yes") * 100
+  )
+print(products_churn)
+
+# Plot churn rate by number of products
+ggplot(products_churn, aes(x = NumOfProducts, y = churn_rate)) +
+  geom_bar(stat = "identity", fill = "purple") +
+  labs(title = "Churn Rate by Number of Products", x = "Number of Products", y = "Churn Rate (%)")
+```
+
+#### Activity Status Impact
+```{r activity-status-impact}
+# Churn rate by active member status
+active_churn <- data %>%
+  group_by(IsActiveMember) %>%
+  summarise(
+    total_customers = n(),
+    churned_customers = sum(churn == "Yes"),
+    churn_rate = mean(churn == "Yes") * 100
+  )
+print(active_churn)
+
+# Plot churn rate by active member status
+ggplot(active_churn, aes(x = IsActiveMember, y = churn_rate)) +
+  geom_bar(stat = "identity", fill = "orange") +
+  labs(title = "Churn Rate by Active Member Status", x = "Active Member", y = "Churn Rate (%)")
+```
+
+#### Tenure Group Impact
+```{r tenure-group-impact}
+# Define tenure groups
+data$tenure_group <- cut(data$Tenure, breaks = c(-1, 2, 5, 10), labels = c("0-2 years", "3-5 years", "6-10 years"))
+
+# Churn rate by tenure group
+tenure_churn <- data %>%
+  group_by(tenure_group) %>%
+  summarise(
+    total_customers = n(),
+    churned_customers = sum(churn == "Yes"),
+    churn_rate = mean(churn == "Yes") * 100
+  )
+print(tenure_churn)
+
+# Plot churn rate by tenure group
+ggplot(tenure_churn, aes(x = tenure_group, y = churn_rate)) +
+  geom_bar(stat = "identity", fill = "red") +
+  labs(title = "Churn Rate by Tenure Group", x = "Tenure Group", y = "Churn Rate (%)")
+```
+
+#### Credit Card Ownership Impact
+```{r credit-card-impact}
+# Churn rate by credit card ownership
+credit_card_churn <- data %>%
+  group_by(HasCrCard) %>%
+  summarise(
+    total_customers = n(),
+    churned_customers = sum(churn == "Yes"),
+    churn_rate = mean(churn == "Yes") * 100
+  )
+print(credit_card_churn)
+
+# Plot churn rate by credit card ownership
+ggplot(credit_card_churn, aes(x = HasCrCard, y = churn_rate)) +
+  geom_bar(stat = "identity", fill = "cyan") +
+  labs(title = "Churn Rate by Credit Card Ownership", x = "Has Credit Card", y = "Churn Rate (%)")
+```
+
+#### Additional Visualizations
+```{r additional-visualizations}
+# Boxplot: Estimated Salary by Churn
+ggplot(data, aes(x = churn, y = estimated_salary, fill = churn)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Estimated Salary by Churn")
+
+# Correlation with churn
+data$churn_num <- as.numeric(data$churn == "Yes")
+numeric_data <- data %>% select_if(is.numeric)
+churn_cor <- cor(numeric_data, data$churn_num, use = "complete.obs")
+churn_cor_df <- data.frame(Feature = rownames(churn_cor), Correlation = churn_cor[,1])
+print(churn_cor_df)
+
+# Significant correlations
+significant_cor <- churn_cor_df[abs(churn_cor_df$Correlation) > 0.1 & churn_cor_df$Feature != "churn_num", ]
+cat("Features with |correlation| > 0.1 with churn:\n")
+print(significant_cor)
+
+# Correlation matrix plot
+corrplot(cor(numeric_data), method = "color", type = "upper", order = "hclust",
+         addCoef.col = "black", number.cex = 0.7, tl.col = "black", tl.srt = 45,
+         col = colorRampPalette(c("blue", "white", "red"))(200),
+         title = "Correlation Matrix", mar = c(0, 0, 1, 0))
+```
+
+
+```{r}
+### Model Performance Visualization
+# Define function to extract metrics from confusionMatrix objects
+extract_metrics <- function(cm) {
+  c(
+    Accuracy = cm$overall["Accuracy"],
+    Kappa = cm$overall["Kappa"],
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    Balanced_Accuracy = cm$byClass["Balanced Accuracy"]
+  )
+}
+
+# Extract metrics for each model
+metrics_rf <- extract_metrics(cm_rf)
+metrics_xgb <- extract_metrics(cm_xgb)
+metrics_tree <- extract_metrics(cm_tree)
+metrics_log <- extract_metrics(cm_log)
+metrics_knn <- extract_metrics(cm_knn)
+
+# Create a list of metrics for each model
+metrics_list <- list(
+  "Random Forest" = metrics_rf,
+  "XGBoost" = metrics_xgb,
+  "Decision Tree" = metrics_tree,
+  "Logistic Regression" = metrics_log,
+  "KNN" = metrics_knn
+)
+
+# Convert the list into a data frame for plotting
+metrics_df <- bind_rows(
+  lapply(names(metrics_list), function(model) {
+    data.frame(
+      Model = model,
+      Metric = names(metrics_list[[model]]),
+      Value = metrics_list[[model]]
+    )
+  })
+)
+
+# Create the bar plot
+ggplot(metrics_df, aes(x = Model, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(title = "Model Performance Comparison", x = "Model", y = "Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Set1")
+```
